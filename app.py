@@ -1,11 +1,8 @@
 import os
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-
-# ============================================================
-# LANGCHAIN IMPORTS
-# ============================================================
 
 from langchain_community.document_loaders import (
     PyPDFLoader,
@@ -13,18 +10,12 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
     WebBaseLoader,
 )
-
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.documents import Document
-
-
-# ============================================================
-# OCR IMPORTS
-# ============================================================
 
 import pytesseract
 from pdf2image import convert_from_path
@@ -32,12 +23,11 @@ from PIL import Image
 
 
 # ============================================================
-# 1. SETUP
+# CONFIGURATION
 # ============================================================
 
 load_dotenv()
 
-# Identify requests made by WebBaseLoader
 os.environ.setdefault(
     "USER_AGENT",
     "IIUI-Policy-Assistant/1.0"
@@ -51,63 +41,60 @@ st.set_page_config(
 
 
 # ============================================================
-# OPENAI API KEY CHECK
+# ENVIRONMENT / API KEY
 # ============================================================
 
-if not os.getenv("OPENAI_API_KEY"):
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
     st.warning(
-        "OPENAI_API_KEY is not configured. "
-        "Please add it to your .env file before using "
-        "the assistant."
+        "GROQ_API_KEY is not configured. "
+        "Please add it to Streamlit Secrets."
     )
 
 
 # ============================================================
-# 2. SIDEBAR — ROLE SELECTION
+# CONSTANTS
 # ============================================================
 
-st.sidebar.title("🎓 IIUI Policy Assistant")
+UPLOAD_DIR = Path("data/documents")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-st.sidebar.markdown(
-    "Ask questions about IIUI policies, academic regulations, "
-    "admissions, fees, etc."
-)
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-user_role = st.sidebar.radio(
-    "You are:",
-    (
-        "Faculty Member",
-        "Student",
-        "Outsider / Prospective Student",
-    ),
-)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 📚 Knowledge Base")
+# Current Groq-supported model.
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 
-uploaded_files = st.sidebar.file_uploader(
-    "Upload policy documents (PDF, DOCX, TXT, PNG, JPG)",
-    type=[
-        "pdf",
-        "docx",
-        "txt",
-        "png",
-        "jpg",
-        "jpeg",
+# ============================================================
+# ACCESS MATRIX
+# ============================================================
+
+ACCESS_MATRIX = {
+    "Faculty Member": [
+        "Faculty policies",
+        "Academic policies",
+        "Examination policies",
+        "University policies",
+        "General University",
     ],
-    accept_multiple_files=True,
-)
-
-
-url_input = st.sidebar.text_input(
-    "Or add an IIUI URL",
-    placeholder="https://www.iiu.edu.pk",
-)
+    "Student": [
+        "Student policies",
+        "Academic policies",
+        "Examination policies",
+        "University policies",
+        "General University",
+    ],
+    "Outsider / Prospective Student": [
+        "Admission policies",
+        "General University",
+        "University policies",
+    ],
+}
 
 
 # ============================================================
-# 3. SESSION STATE
+# SESSION STATE
 # ============================================================
 
 if "vectorstore" not in st.session_state:
@@ -121,57 +108,49 @@ if "index_signature" not in st.session_state:
 
 
 # ============================================================
-# 4. ACCESS CONTROL MATRIX
+# EMBEDDINGS
 # ============================================================
 
-ACCESS_MATRIX = {
-    "Faculty Member": [
-        "Admissions",
-        "Fees",
-        "Academic",
-        "Examination",
-        "Student Affairs",
-        "Faculty / HR",
-        "Scholarships",
-        "Internship",
-        "Hostel",
-        "Transport",
-        "Hospital",
-        "Departments",
-        "General University",
-        "Public",
-    ],
+@st.cache_resource
+def get_embeddings():
+    """
+    Load the Hugging Face embedding model once and reuse it.
 
-    "Student": [
-        "Admissions",
-        "Fees",
-        "Academic",
-        "Examination",
-        "Student Affairs",
-        "Scholarships",
-        "Internship",
-        "Hostel",
-        "Transport",
-        "Hospital",
-        "Departments",
-        "General University",
-        "Public",
-    ],
-
-    "Outsider / Prospective Student": [
-        "Admissions",
-        "Fees",
-        "Public",
-        "General University",
-        "Scholarships",
-        "Hostel",
-        "Departments",
-    ],
-}
+    This does not require an API key.
+    The model runs locally on the Streamlit server.
+    """
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL
+    )
 
 
 # ============================================================
-# 5. OCR FUNCTIONS
+# GROQ LLM
+# ============================================================
+
+@st.cache_resource
+def get_llm():
+    """
+    Create the Groq LLM using Groq's OpenAI-compatible API.
+    """
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "GROQ_API_KEY is not configured."
+        )
+
+    return ChatOpenAI(
+        model=GROQ_MODEL,
+        temperature=0,
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+    )
+
+
+# ============================================================
+# OCR FUNCTIONS
 # ============================================================
 
 def ocr_pdf(file_path):
@@ -179,36 +158,40 @@ def ocr_pdf(file_path):
     Extract text from a scanned PDF using OCR.
     """
 
-    text = ""
+    documents = []
 
     try:
         images = convert_from_path(
             file_path,
-            dpi=300,
+            dpi=300
         )
 
-        for page_number, img in enumerate(
-            images,
-            start=1,
-        ):
+        for page_number, image in enumerate(images, start=1):
 
-            page_text = pytesseract.image_to_string(
-                img,
-                lang="eng",
+            text = pytesseract.image_to_string(
+                image,
+                lang="eng"
             )
 
-            text += (
-                f"\n--- Page {page_number} ---\n"
-                f"{page_text}"
-            )
+            if text.strip():
+
+                documents.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "source": str(file_path),
+                            "page": page_number,
+                            "type": "OCR PDF",
+                        },
+                    )
+                )
 
     except Exception as e:
-
-        st.warning(
-            f"OCR failed for {file_path}: {e}"
+        st.error(
+            f"OCR failed for PDF {file_path}: {str(e)}"
         )
 
-    return text
+    return documents
 
 
 def ocr_image(file_path):
@@ -218,186 +201,274 @@ def ocr_image(file_path):
 
     try:
 
-        img = Image.open(file_path)
+        image = Image.open(file_path)
 
-        return pytesseract.image_to_string(
-            img,
-            lang="eng",
+        text = pytesseract.image_to_string(
+            image,
+            lang="eng"
         )
+
+        if not text.strip():
+            return []
+
+        return [
+            Document(
+                page_content=text,
+                metadata={
+                    "source": str(file_path),
+                    "page": 1,
+                    "type": "OCR Image",
+                },
+            )
+        ]
 
     except Exception as e:
 
-        st.warning(
-            f"OCR failed for {file_path}: {e}"
+        st.error(
+            f"OCR failed for image {file_path}: {str(e)}"
         )
 
-        return ""
+        return []
 
+
+# ============================================================
+# SCANNED PDF DETECTION
+# ============================================================
 
 def is_scanned_pdf(file_path):
     """
-    Return True if the PDF contains almost no
-    extractable text.
+    Detect whether a PDF appears to be scanned.
+
+    If extracted text is extremely small, OCR is used.
     """
 
     try:
 
-        docs = PyPDFLoader(
-            file_path
-        ).load()
+        loader = PyPDFLoader(str(file_path))
 
-        total_text = "".join(
-            document.page_content.strip()
-            for document in docs
+        documents = loader.load()
+
+        total_text = sum(
+            len(document.page_content.strip())
+            for document in documents
         )
 
-        return len(total_text) < 100
+        return total_text < 100
 
     except Exception:
-
         return True
 
 
 # ============================================================
-# 6. DOCUMENT INGESTION
+# DOCUMENT LOADING
 # ============================================================
 
-@st.cache_resource(show_spinner=False)
-def build_vectorstore(file_paths, url):
+def load_document(file_path):
     """
-    Load documents, OCR scanned documents,
-    split documents into chunks, and create
-    a FAISS vector store.
+    Load a document based on its file extension.
     """
 
-    documents = []
-    logs = []
+    extension = Path(file_path).suffix.lower()
 
     # --------------------------------------------------------
-    # Uploaded documents
+    # PDF
     # --------------------------------------------------------
 
-    for path in file_paths:
+    if extension == ".pdf":
 
-        extension = (
-            path.lower()
-            .split(".")[-1]
-        )
+        if is_scanned_pdf(file_path):
 
-        # ----------------------------------------------------
-        # PDF
-        # ----------------------------------------------------
-
-        if extension == "pdf":
-
-            if is_scanned_pdf(path):
-
-                logs.append(
-                    "🔍 Scanned PDF detected: "
-                    f"{os.path.basename(path)} — "
-                    "running OCR..."
-                )
-
-                ocr_text = ocr_pdf(
-                    path
-                )
-
-                if ocr_text.strip():
-
-                    documents.append(
-                        Document(
-                            page_content=ocr_text,
-                            metadata={
-                                "source": path,
-                                "type": "scanned_pdf",
-                            },
-                        )
-                    )
-
-            else:
-
-                pdf_documents = (
-                    PyPDFLoader(path).load()
-                )
-
-                documents.extend(
-                    pdf_documents
-                )
-
-        # ----------------------------------------------------
-        # DOCX
-        # ----------------------------------------------------
-
-        elif extension == "docx":
-
-            docx_documents = (
-                Docx2txtLoader(path).load()
-            )
-
-            documents.extend(
-                docx_documents
-            )
-
-        # ----------------------------------------------------
-        # TXT
-        # ----------------------------------------------------
-
-        elif extension == "txt":
-
-            txt_documents = (
-                TextLoader(
-                    path,
-                    encoding="utf-8",
-                ).load()
-            )
-
-            documents.extend(
-                txt_documents
-            )
-
-        # ----------------------------------------------------
-        # IMAGE
-        # ----------------------------------------------------
-
-        elif extension in [
-            "png",
-            "jpg",
-            "jpeg",
-        ]:
-
-            logs.append(
-                "🖼️ Image detected: "
-                f"{os.path.basename(path)} — "
-                "running OCR..."
-            )
-
-            ocr_text = ocr_image(
-                path
-            )
-
-            if ocr_text.strip():
-
-                documents.append(
-                    Document(
-                        page_content=ocr_text,
-                        metadata={
-                            "source": path,
-                            "type": "image",
-                        },
-                    )
-                )
-
-    # ========================================================
-    # URL
-    # ========================================================
-
-    if url:
+            return ocr_pdf(file_path)
 
         try:
 
-            url_documents = (
-                WebBaseLoader(url).load()
+            loader = PyPDFLoader(
+                str(file_path)
             )
+
+            documents = loader.load()
+
+            for document in documents:
+
+                document.metadata.setdefault(
+                    "source",
+                    str(file_path)
+                )
+
+                document.metadata.setdefault(
+                    "type",
+                    "PDF"
+                )
+
+            return documents
+
+        except Exception as e:
+
+            st.warning(
+                f"Normal PDF extraction failed. "
+                f"Trying OCR: {str(e)}"
+            )
+
+            return ocr_pdf(file_path)
+
+    # --------------------------------------------------------
+    # DOCX
+    # --------------------------------------------------------
+
+    if extension == ".docx":
+
+        try:
+
+            loader = Docx2txtLoader(
+                str(file_path)
+            )
+
+            documents = loader.load()
+
+            for document in documents:
+
+                document.metadata.setdefault(
+                    "source",
+                    str(file_path)
+                )
+
+                document.metadata.setdefault(
+                    "type",
+                    "DOCX"
+                )
+
+            return documents
+
+        except Exception as e:
+
+            st.error(
+                f"Failed to load DOCX {file_path}: {str(e)}"
+            )
+
+            return []
+
+    # --------------------------------------------------------
+    # TXT
+    # --------------------------------------------------------
+
+    if extension == ".txt":
+
+        try:
+
+            loader = TextLoader(
+                str(file_path),
+                encoding="utf-8"
+            )
+
+            documents = loader.load()
+
+            for document in documents:
+
+                document.metadata.setdefault(
+                    "source",
+                    str(file_path)
+                )
+
+                document.metadata.setdefault(
+                    "type",
+                    "TXT"
+                )
+
+            return documents
+
+        except UnicodeDecodeError:
+
+            try:
+
+                loader = TextLoader(
+                    str(file_path),
+                    encoding="latin-1"
+                )
+
+                return loader.load()
+
+            except Exception as e:
+
+                st.error(
+                    f"Failed to load TXT {file_path}: {str(e)}"
+                )
+
+                return []
+
+        except Exception as e:
+
+            st.error(
+                f"Failed to load TXT {file_path}: {str(e)}"
+            )
+
+            return []
+
+    # --------------------------------------------------------
+    # IMAGE
+    # --------------------------------------------------------
+
+    if extension in [".png", ".jpg", ".jpeg"]:
+
+        return ocr_image(file_path)
+
+    return []
+
+
+# ============================================================
+# VECTOR STORE
+# ============================================================
+
+def build_vectorstore(file_paths, url=None):
+    """
+    Build FAISS vector store from uploaded documents
+    and optionally a web URL.
+    """
+
+    documents = []
+
+    # --------------------------------------------------------
+    # Load local documents
+    # --------------------------------------------------------
+
+    for file_path in file_paths:
+
+        loaded_documents = load_document(
+            file_path
+        )
+
+        documents.extend(
+            loaded_documents
+        )
+
+    # --------------------------------------------------------
+    # Load URL
+    # --------------------------------------------------------
+
+    if url and url.strip():
+
+        try:
+
+            st.info(
+                f"Loading URL: {url}"
+            )
+
+            loader = WebBaseLoader(
+                url.strip()
+            )
+
+            url_documents = loader.load()
+
+            for document in url_documents:
+
+                document.metadata.setdefault(
+                    "source",
+                    url.strip()
+                )
+
+                document.metadata.setdefault(
+                    "type",
+                    "Web Page"
+                )
 
             documents.extend(
                 url_documents
@@ -405,345 +476,155 @@ def build_vectorstore(file_paths, url):
 
         except Exception as e:
 
-            logs.append(
-                f"Could not load URL: {e}"
+            st.error(
+                f"Failed to load URL: {str(e)}"
             )
 
-    # ========================================================
-    # No documents
-    # ========================================================
+    # --------------------------------------------------------
+    # Validate documents
+    # --------------------------------------------------------
 
     if not documents:
 
-        return None, logs
+        raise ValueError(
+            "No readable documents were found."
+        )
 
-    # ========================================================
+    # --------------------------------------------------------
+    # Default metadata
+    # --------------------------------------------------------
+
+    for document in documents:
+
+        document.metadata.setdefault(
+            "category",
+            "General University"
+        )
+
+        document.metadata.setdefault(
+            "role_access",
+            "Public"
+        )
+
+    # --------------------------------------------------------
     # Split documents
-    # ========================================================
+    # --------------------------------------------------------
 
-    splitter = RecursiveCharacterTextSplitter(
+    text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=150,
     )
 
-    chunks = splitter.split_documents(
+    chunks = text_splitter.split_documents(
         documents
     )
 
-    # ========================================================
-    # Add metadata
-    # ========================================================
+    if not chunks:
 
-    for chunk in chunks:
-
-        chunk.metadata.setdefault(
-            "category",
-            "General University",
+        raise ValueError(
+            "No text chunks were generated from the documents."
         )
 
-        chunk.metadata.setdefault(
-            "role_access",
-            "Public",
-        )
+    # --------------------------------------------------------
+    # Hugging Face Embeddings
+    # --------------------------------------------------------
 
-    # ========================================================
-    # Create embeddings
-    # ========================================================
+    embeddings = get_embeddings()
 
-    embeddings = OpenAIEmbeddings()
-
-    # ========================================================
-    # Create FAISS
-    # ========================================================
+    # --------------------------------------------------------
+    # Build FAISS index
+    # --------------------------------------------------------
 
     vectorstore = FAISS.from_documents(
         chunks,
-        embeddings,
+        embeddings
     )
 
-    return vectorstore, logs
+    return vectorstore
 
 
 # ============================================================
-# 7. UPLOAD SIGNATURE
+# SOURCE FORMATTER
 # ============================================================
 
-def _upload_signature(
-    uploaded_files,
-    url,
-):
+def format_sources(documents):
     """
-    Create a stable signature of current inputs.
+    Format retrieved documents as source references.
     """
 
-    names = tuple(
-        sorted(
-            file.name
-            for file in (
-                uploaded_files or []
-            )
-        )
-    )
+    sources = []
 
-    return (
-        names,
-        url or "",
-    )
+    for document in documents:
 
-
-current_sig = _upload_signature(
-    uploaded_files,
-    url_input,
-)
-
-
-# ============================================================
-# 8. PROCESS UPLOADED FILES
-# ============================================================
-
-if (
-    uploaded_files or url_input
-) and (
-    current_sig
-    != st.session_state.index_signature
-):
-
-    os.makedirs(
-        "data/documents",
-        exist_ok=True,
-    )
-
-    saved_paths = []
-
-    # --------------------------------------------------------
-    # Save uploaded files
-    # --------------------------------------------------------
-
-    for uploaded_file in (
-        uploaded_files or []
-    ):
-
-        path = os.path.join(
-            "data/documents",
-            uploaded_file.name,
+        source = document.metadata.get(
+            "source",
+            "Unknown source"
         )
 
-        with open(
-            path,
-            "wb",
-        ) as file:
-
-            file.write(
-                uploaded_file.getbuffer()
-            )
-
-        saved_paths.append(
-            path
+        page = document.metadata.get(
+            "page"
         )
 
-    # --------------------------------------------------------
-    # Build vector store
-    # --------------------------------------------------------
+        if page is not None:
 
-    with st.spinner(
-        "Indexing documents. "
-        "This may take time for scanned files..."
-    ):
+            try:
+                page_number = int(page) + 1
+            except Exception:
+                page_number = page
 
-        try:
-
-            vectorstore, logs = (
-                build_vectorstore(
-                    tuple(saved_paths),
-                    url_input,
-                )
+            sources.append(
+                f"{source} - Page {page_number}"
             )
 
-            st.session_state.vectorstore = (
-                vectorstore
+        else:
+
+            sources.append(
+                str(source)
             )
 
-            st.session_state.index_signature = (
-                current_sig
-            )
+    # Remove duplicates while preserving order
 
-            # ------------------------------------------------
-            # Logs
-            # ------------------------------------------------
-
-            for msg in logs:
-
-                st.sidebar.info(
-                    msg
-                )
-
-            # ------------------------------------------------
-            # Success
-            # ------------------------------------------------
-
-            if vectorstore is not None:
-
-                document_count = len(
-                    saved_paths
-                )
-
-                url_text = (
-                    " + URL"
-                    if url_input
-                    else ""
-                )
-
-                st.sidebar.success(
-                    f"✅ Indexed "
-                    f"{document_count} "
-                    f"document(s)"
-                    f"{url_text}"
-                )
-
-        except Exception as e:
-
-            st.error(
-                "Document indexing failed: "
-                f"{e}"
-            )
-
-
-# ============================================================
-# 9. RAG PROMPT
-# ============================================================
-
-SYSTEM_PROMPT_TEMPLATE = """
-You are the IIUI Policy Assistant.
-
-You answer questions using ONLY the IIUI
-policy information provided in the context.
-
-User role:
-{user_role}
-
-Authorized categories:
-{authorized_categories}
-
-IMPORTANT RULES:
-
-1. Do NOT invent IIUI policies.
-
-2. Do NOT use general knowledge to create
-   or assume an IIUI policy.
-
-3. If the answer cannot be found in the
-   provided context, clearly say:
-
-   "The information was not found in the
-   available IIUI policy documents."
-
-4. Prefer the latest and active policy
-   information when multiple sources exist.
-
-5. If the context contains a source document
-   or page number, mention it.
-
-6. If the policy contains conditions,
-   dates, exceptions, eligibility requirements,
-   fees, or procedures, mention them accurately.
-
-7. Answer clearly and concisely.
-
-8. Do not claim that a policy exists unless
-   it is supported by the provided context.
-
-CONTEXT:
-{context}
-
-QUESTION:
-{question}
-
-ANSWER:
-"""
-
-
-# ============================================================
-# 10. CREATE PROMPT
-# ============================================================
-
-def get_prompt(user_role):
-    """
-    Create the RAG prompt for the selected role.
-    """
-
-    authorized_categories = ", ".join(
-        ACCESS_MATRIX.get(
-            user_role,
-            ["Public"],
-        )
-    )
-
-    prompt_text = (
-        SYSTEM_PROMPT_TEMPLATE
-        .replace(
-            "{user_role}",
-            user_role,
-        )
-        .replace(
-            "{authorized_categories}",
-            authorized_categories,
-        )
-    )
-
-    return PromptTemplate(
-        template=prompt_text,
-        input_variables=[
-            "context",
-            "question",
-        ],
+    return list(
+        dict.fromkeys(sources)
     )
 
 
 # ============================================================
-# 11. RAG ANSWER
+# POLICY ASSISTANT
 # ============================================================
 
 def ask_policy_assistant(
+    question,
     vectorstore,
-    user_role,
-    user_query,
+    role
 ):
     """
-    Retrieve relevant documents from FAISS,
-    send the retrieved context to the LLM,
-    and return the answer and sources.
-
-    This intentionally does NOT use RetrievalQA.
+    Retrieve relevant policy documents and
+    ask Groq to answer using only those documents.
     """
 
-    # --------------------------------------------------------
-    # Retriever
-    # --------------------------------------------------------
-
-    retriever = vectorstore.as_retriever(
-        search_kwargs={
-            "k": 4,
-        }
-    )
-
-    # --------------------------------------------------------
-    # Retrieve relevant documents
-    # --------------------------------------------------------
-
-    source_documents = retriever.invoke(
-        user_query
-    )
-
-    # --------------------------------------------------------
-    # No relevant documents
-    # --------------------------------------------------------
-
-    if not source_documents:
+    if vectorstore is None:
 
         return (
-            "The information was not found in the "
-            "available IIUI policy documents.",
-            [],
+            "Please upload and index policy documents first.",
+            []
+        )
+
+    # --------------------------------------------------------
+    # Retrieve documents
+    # --------------------------------------------------------
+
+    retrieved_documents = vectorstore.similarity_search(
+        question,
+        k=4
+    )
+
+    if not retrieved_documents:
+
+        return (
+            "I could not find relevant information "
+            "in the available IIUI policy documents.",
+            []
         )
 
     # --------------------------------------------------------
@@ -753,31 +634,37 @@ def ask_policy_assistant(
     context_parts = []
 
     for index, document in enumerate(
-        source_documents,
-        start=1,
+        retrieved_documents,
+        start=1
     ):
 
         source = document.metadata.get(
             "source",
-            "Unknown",
+            "Unknown source"
         )
 
         page = document.metadata.get(
-            "page",
-            "N/A",
+            "page"
+        )
+
+        category = document.metadata.get(
+            "category",
+            "General University"
         )
 
         context_parts.append(
             f"""
---- SOURCE {index} ---
-Document: {os.path.basename(str(source))}
-Page: {page}
+SOURCE {index}
+Category: {category}
+Source: {source}
+Page: {page if page is not None else "N/A"}
 
+CONTENT:
 {document.page_content}
 """
         )
 
-    context = "\n".join(
+    context = "\n\n".join(
         context_parts
     )
 
@@ -785,42 +672,231 @@ Page: {page}
     # Prompt
     # --------------------------------------------------------
 
-    prompt = get_prompt(
-        user_role
+    prompt_template = """
+You are the IIUI Policy Assistant.
+
+Your task is to answer questions using ONLY the
+provided IIUI policy context.
+
+User role:
+{role}
+
+Important rules:
+
+1. Answer only from the provided policy context.
+2. Do not invent or assume university rules.
+3. If the answer is not available in the context,
+   clearly say that the available policy documents
+   do not contain enough information.
+4. Give a concise but useful answer.
+5. If relevant, mention the source document.
+6. Do not claim something is official unless the
+   provided context supports it.
+7. If the question is unrelated to IIUI policies,
+   politely explain that you can only answer
+   IIUI policy-related questions.
+8. Prefer clear bullet points when explaining
+   multiple rules or requirements.
+
+POLICY CONTEXT:
+
+{context}
+
+USER QUESTION:
+
+{question}
+
+ANSWER:
+"""
+
+    prompt = PromptTemplate(
+        template=prompt_template,
+        input_variables=[
+            "role",
+            "context",
+            "question",
+        ],
     )
 
     formatted_prompt = prompt.format(
+        role=role,
         context=context,
-        question=user_query,
+        question=question,
     )
 
     # --------------------------------------------------------
-    # LLM
+    # Groq
     # --------------------------------------------------------
 
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,
-    )
+    try:
+
+        llm = get_llm()
+
+        response = llm.invoke(
+            formatted_prompt
+        )
+
+        answer = response.content
+
+    except Exception as e:
+
+        answer = (
+            f"Unable to get a response from Groq API.\n\n"
+            f"Error: {str(e)}"
+        )
 
     # --------------------------------------------------------
-    # Generate answer
+    # Sources
     # --------------------------------------------------------
 
-    response = llm.invoke(
-        formatted_prompt
+    sources = format_sources(
+        retrieved_documents
     )
 
-    answer = response.content
-
-    return (
-        answer,
-        source_documents,
-    )
+    return answer, sources
 
 
 # ============================================================
-# 12. MAIN CHAT UI
+# SAVE UPLOADED FILE
+# ============================================================
+
+def save_uploaded_file(uploaded_file):
+    """
+    Save Streamlit uploaded file to local storage.
+    """
+
+    file_path = (
+        UPLOAD_DIR /
+        uploaded_file.name
+    )
+
+    with open(
+        file_path,
+        "wb"
+    ) as file:
+
+        file.write(
+            uploaded_file.getbuffer()
+        )
+
+    return str(file_path)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title(
+    "🎓 IIUI Policy Assistant"
+)
+
+st.sidebar.markdown(
+    "Upload IIUI policy documents and ask questions."
+)
+
+st.sidebar.divider()
+
+role = st.sidebar.selectbox(
+    "Select your role",
+    [
+        "Faculty Member",
+        "Student",
+        "Outsider / Prospective Student",
+    ],
+)
+
+st.sidebar.divider()
+
+st.sidebar.subheader(
+    "Policy Documents"
+)
+
+uploaded_files = st.sidebar.file_uploader(
+    "Upload PDF, DOCX, TXT or Images",
+    type=[
+        "pdf",
+        "docx",
+        "txt",
+        "png",
+        "jpg",
+        "jpeg",
+    ],
+    accept_multiple_files=True,
+)
+
+url = st.sidebar.text_input(
+    "Policy URL (optional)",
+    placeholder="https://example.com/policy"
+)
+
+index_button = st.sidebar.button(
+    "📚 Build / Rebuild Index",
+    use_container_width=True,
+)
+
+
+# ============================================================
+# INDEX DOCUMENTS
+# ============================================================
+
+if index_button:
+
+    if not uploaded_files and not url.strip():
+
+        st.sidebar.warning(
+            "Please upload at least one document "
+            "or provide a URL."
+        )
+
+    else:
+
+        try:
+
+            with st.spinner(
+                "Processing documents and building index..."
+            ):
+
+                file_paths = []
+
+                for uploaded_file in uploaded_files:
+
+                    file_path = save_uploaded_file(
+                        uploaded_file
+                    )
+
+                    file_paths.append(
+                        file_path
+                    )
+
+                vectorstore = build_vectorstore(
+                    file_paths=file_paths,
+                    url=url,
+                )
+
+                st.session_state.vectorstore = (
+                    vectorstore
+                )
+
+                st.session_state.messages = []
+
+                st.session_state.index_signature = (
+                    tuple(file_paths),
+                    url.strip(),
+                )
+
+            st.sidebar.success(
+                "Policy index created successfully."
+            )
+
+        except Exception as e:
+
+            st.sidebar.error(
+                f"Document indexing failed: {str(e)}"
+            )
+
+
+# ============================================================
+# MAIN PAGE
 # ============================================================
 
 st.title(
@@ -828,23 +904,54 @@ st.title(
 )
 
 st.caption(
-    f"You are logged in as: **{user_role}**"
+    "Ask questions about IIUI policies, rules and procedures."
 )
 
-st.markdown(
-    "Ask questions about IIUI policies, "
-    "academic regulations, admissions, fees "
-    "and university procedures."
+# ------------------------------------------------------------
+# Role information
+# ------------------------------------------------------------
+
+allowed_categories = ACCESS_MATRIX.get(
+    role,
+    []
 )
 
-
-# ============================================================
-# 13. DISPLAY CHAT HISTORY
-# ============================================================
-
-for message in (
-    st.session_state.messages
+with st.expander(
+    f"Current Role: {role}"
 ):
+
+    st.write(
+        "The assistant is configured for this role."
+    )
+
+    st.write(
+        "Relevant policy categories:"
+    )
+
+    for category in allowed_categories:
+
+        st.write(
+            f"• {category}"
+        )
+
+
+# ============================================================
+# CHECK INDEX
+# ============================================================
+
+if st.session_state.vectorstore is None:
+
+    st.info(
+        "👈 Upload your policy documents from the sidebar "
+        "and click **Build / Rebuild Index**."
+    )
+
+
+# ============================================================
+# CHAT HISTORY
+# ============================================================
+
+for message in st.session_state.messages:
 
     with st.chat_message(
         message["role"]
@@ -854,17 +961,32 @@ for message in (
             message["content"]
         )
 
+        if (
+            message["role"] == "assistant"
+            and message.get("sources")
+        ):
+
+            with st.expander(
+                "📚 Sources"
+            ):
+
+                for source in message["sources"]:
+
+                    st.write(
+                        f"• {source}"
+                    )
+
 
 # ============================================================
-# 14. CHAT INPUT
+# CHAT INPUT
 # ============================================================
 
-user_query = st.chat_input(
-    "Ask your question..."
+question = st.chat_input(
+    "Ask an IIUI policy question..."
 )
 
 
-if user_query:
+if question:
 
     # --------------------------------------------------------
     # User message
@@ -873,213 +995,83 @@ if user_query:
     st.session_state.messages.append(
         {
             "role": "user",
-            "content": user_query,
+            "content": question,
         }
     )
 
-    with st.chat_message(
-        "user"
-    ):
+    with st.chat_message("user"):
 
         st.markdown(
-            user_query
+            question
         )
 
     # --------------------------------------------------------
-    # Check vector store
+    # Assistant response
     # --------------------------------------------------------
 
-    if (
-        st.session_state.vectorstore
-        is None
-    ):
+    with st.chat_message("assistant"):
 
-        warning = (
-            "⚠️ Please upload at least one "
-            "policy document or add a URL "
-            "in the sidebar to begin."
-        )
+        if st.session_state.vectorstore is None:
 
-        with st.chat_message(
-            "assistant"
-        ):
-
-            st.warning(
-                warning
+            answer = (
+                "Please upload and index the IIUI "
+                "policy documents first."
             )
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": warning,
-            }
-        )
+            sources = []
 
-    else:
-
-        with st.chat_message(
-            "assistant"
-        ):
+        else:
 
             with st.spinner(
                 "Searching IIUI policies..."
             ):
 
-                try:
+                answer, sources = (
+                    ask_policy_assistant(
+                        question=question,
+                        vectorstore=(
+                            st.session_state.vectorstore
+                        ),
+                        role=role,
+                    )
+                )
 
-                    # ------------------------------------------------
-                    # Ask assistant
-                    # ------------------------------------------------
+        st.markdown(
+            answer
+        )
 
-                    answer, sources = (
-                        ask_policy_assistant(
-                            st.session_state.vectorstore,
-                            user_role,
-                            user_query,
-                        )
+        if sources:
+
+            with st.expander(
+                "📚 Sources"
+            ):
+
+                for source in sources:
+
+                    st.write(
+                        f"• {source}"
                     )
 
-                    # ------------------------------------------------
-                    # Display answer
-                    # ------------------------------------------------
+    # --------------------------------------------------------
+    # Save assistant message
+    # --------------------------------------------------------
 
-                    st.markdown(
-                        answer
-                    )
-
-                    # ------------------------------------------------
-                    # Display sources
-                    # ------------------------------------------------
-
-                    if sources:
-
-                        st.markdown(
-                            "---"
-                        )
-
-                        st.markdown(
-                            "**📖 Sources:**"
-                        )
-
-                        seen = set()
-
-                        for document in sources:
-
-                            title = document.metadata.get(
-                                "source",
-                                "Unknown",
-                            )
-
-                            page = document.metadata.get(
-                                "page",
-                                "N/A",
-                            )
-
-                            key = (
-                                f"{title}-{page}"
-                            )
-
-                            if key in seen:
-                                continue
-
-                            seen.add(
-                                key
-                            )
-
-                            st.markdown(
-                                f"- "
-                                f"`{os.path.basename(str(title))}` "
-                                f"— Page {page}"
-                            )
-
-                    # ------------------------------------------------
-                    # Source text for chat history
-                    # ------------------------------------------------
-
-                    if sources:
-
-                        parts = []
-
-                        for document in sources:
-
-                            source = os.path.basename(
-                                str(
-                                    document.metadata.get(
-                                        "source",
-                                        "?",
-                                    )
-                                )
-                            )
-
-                            page = document.metadata.get(
-                                "page",
-                                "?",
-                            )
-
-                            source_item = (
-                                f"{source} "
-                                f"(p.{page})"
-                            )
-
-                            if (
-                                source_item
-                                not in parts
-                            ):
-
-                                parts.append(
-                                    source_item
-                                )
-
-                        source_text = (
-                            "\n\n**Sources:** "
-                            + ", ".join(parts)
-                        )
-
-                    else:
-
-                        source_text = ""
-
-                    # ------------------------------------------------
-                    # Save assistant response
-                    # ------------------------------------------------
-
-                    full_response = (
-                        answer
-                        + source_text
-                    )
-
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": full_response,
-                        }
-                    )
-
-                except Exception as e:
-
-                    error_message = (
-                        f"Error: {e}"
-                    )
-
-                    st.error(
-                        error_message
-                    )
-
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": error_message,
-                        }
-                    )
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+        }
+    )
 
 
 # ============================================================
-# 15. FOOTER
+# FOOTER
 # ============================================================
 
-st.sidebar.markdown("---")
+st.divider()
 
-st.sidebar.caption(
-    "MVP v1.0 — Grounded answers with citations. "
-    "Built with Streamlit + LangChain + FAISS + OCR."
+st.caption(
+    "IIUI Policy Assistant • Powered by Groq + "
+    "Local Hugging Face Embeddings + FAISS"
 )
