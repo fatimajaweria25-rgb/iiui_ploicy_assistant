@@ -7,10 +7,11 @@ langchain-text-splitters==0.2.2
 langchain-openai==0.1.25
 
 faiss-cpu==1.8.0
-sentence-transformers
 
 openai
 tiktoken
+
+sentence-transformers
 
 pytesseract
 pdf2image
